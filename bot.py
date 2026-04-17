@@ -1,73 +1,74 @@
-import os, re, logging, asyncio, zipfile, tempfile, shutil
+import os, re, logging, asyncio, zipfile, tempfile, shutil, time
 from pathlib import Path
 from collections import defaultdict
 from PIL import Image
 import img2pdf
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
-from telegram.error import TimedOut, NetworkError, RetryAfter
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8663170411:AAEer7ziKHmqIg1TZ-7QN_jzSd17aH6gNfc")
-MAX_MB    = int(os.environ.get("MAX_FILE_SIZE_MB", 125))
-MAX_BYTES = MAX_MB * 1024 * 1024
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+API_ID    = int(os.environ.get("API_ID",    "37623239"))
+API_HASH  =     os.environ.get("API_HASH",  "9661c0bdbd8392709dd93139e8c3afcb")
+BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8663170411:AAEer7ziKHmqIg1TZ-7QN_jzSd17aH6gNfc")
+
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ─── PER-USER QUEUE ───────────────────────────────────────────────────────────
-user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
-user_workers: dict[int, asyncio.Task]  = {}
+app = Client("cbz_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ─── PROGRESS HELPER ──────────────────────────────────────────────────────────
-async def prog(msg, text: str):
-    try:
-        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after + 1)
-        await prog(msg, text)
-    except Exception:
-        pass
+# ── PER-USER QUEUE ─────────────────────────────────────────────────────────────
+user_queues:  dict = defaultdict(asyncio.Queue)
+user_workers: dict = {}
 
+# ── PROGRESS HELPERS ───────────────────────────────────────────────────────────
 def bar(pct: int) -> str:
     filled = int(pct / 10)
     return "█" * filled + "░" * (10 - filled)
 
-def status_text(step: str, pct: int, filename: str, extra: str = "") -> str:
-    return (
-        f"*{filename}*\n\n"
-        f"{step}\n"
-        f"`{bar(pct)}` *{pct}%*"
-        + (f"\n\n_{extra}_" if extra else "")
-    )
+def make_text(step: str, pct: int, fname: str, extra: str = "") -> str:
+    txt = f"**{fname}**\n\n{step}\n`{bar(pct)}` **{pct}%**"
+    if extra:
+        txt += f"\n\n__{extra}__"
+    return txt
 
-# ─── CONVERSION LOGIC ─────────────────────────────────────────────────────────
-def extract_cbz(cbz_path: Path, out_dir: Path) -> list[Path]:
+async def safe_edit(msg: Message, text: str) -> None:
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+# ── CORE LOGIC ─────────────────────────────────────────────────────────────────
+def natural_key(name: str) -> list:
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', name)]
+
+def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
     if not zipfile.is_zipfile(cbz_path):
         raise ValueError("Not a valid CBZ/ZIP file.")
     with zipfile.ZipFile(cbz_path, "r") as zf:
         for name in zf.namelist():
             if ".." in name or name.startswith("/"):
-                raise ValueError("Unsafe path in archive.")
+                raise ValueError("Unsafe path detected in archive.")
         zf.extractall(out_dir)
-    images = [p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED]
+    images = [
+        p for p in out_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED
+    ]
     if not images:
-        raise ValueError("No images found inside the CBZ file.")
-    def natural_key(p):
-        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', p.name)]
-    return sorted(images, key=natural_key)
+        raise ValueError("No supported images found inside CBZ.")
+    return sorted(images, key=lambda p: natural_key(p.name))
 
-def convert_to_pdf(images: list[Path], pdf_path: Path) -> None:
+def convert_to_pdf(images: list, pdf_path: Path) -> None:
     safe, temps = [], []
     for img_path in images:
         try:
             with Image.open(img_path) as im:
                 if im.mode in ("RGBA", "P", "LA", "L"):
-                    conv = img_path.with_suffix("._conv.jpg")
+                    conv = img_path.with_suffix("._c.jpg")
                     im.convert("RGB").save(conv, "JPEG", quality=95)
-                    safe.append(conv); temps.append(conv)
+                    safe.append(conv)
+                    temps.append(conv)
                 else:
                     safe.append(img_path)
         except Exception as e:
@@ -80,38 +81,29 @@ def convert_to_pdf(images: list[Path], pdf_path: Path) -> None:
         with open(pdf_path, "wb") as f:
             f.write(img2pdf.convert([str(p) for p in safe]))
     except Exception:
-        log.info("img2pdf failed → Pillow fallback")
-        pil_imgs = []
+        log.info("img2pdf failed — falling back to Pillow")
+        imgs = []
         for p in safe:
-            try: pil_imgs.append(Image.open(p).convert("RGB"))
-            except Exception: pass
-        if not pil_imgs:
-            raise ValueError("Could not read images with Pillow either.")
-        pil_imgs[0].save(pdf_path, save_all=True, append_images=pil_imgs[1:], format="PDF")
+            try:
+                imgs.append(Image.open(p).convert("RGB"))
+            except Exception:
+                pass
+        if not imgs:
+            raise ValueError("Pillow fallback also failed.")
+        imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:], format="PDF")
     finally:
-        for p in temps: p.unlink(missing_ok=True)
+        for p in temps:
+            p.unlink(missing_ok=True)
 
-# ─── PROCESS ONE FILE ─────────────────────────────────────────────────────────
-async def process_one(chat_id: int, document, context: ContextTypes.DEFAULT_TYPE):
-    fname    = document.file_name or "file.cbz"
-    stem     = Path(fname).stem
+# ── PROCESS ONE FILE ───────────────────────────────────────────────────────────
+async def process_one(chat_id: int, message: Message) -> None:
+    doc   = message.document
+    fname = doc.file_name or "file.cbz"
+    stem  = Path(fname).stem
     pdf_name = f"{stem}.pdf"
 
-    # Size check
-    if (document.file_size or 0) > MAX_BYTES:
-        sz = (document.file_size or 0) / 1024 / 1024
-        await context.bot.send_message(
-            chat_id,
-            f"❌ *{fname}* is {sz:.1f} MB — max allowed is {MAX_MB} MB.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    # Initial status message
-    status = await context.bot.send_message(
-        chat_id,
-        status_text("📥 Receiving file...", 0, fname),
-        parse_mode=ParseMode.MARKDOWN,
+    status = await app.send_message(
+        chat_id, make_text("📥 Starting...", 0, fname)
     )
 
     work_dir    = Path(tempfile.mkdtemp(prefix="cbzbot_"))
@@ -120,139 +112,147 @@ async def process_one(chat_id: int, document, context: ContextTypes.DEFAULT_TYPE
     extract_dir.mkdir()
     pdf_path    = work_dir / pdf_name
 
-    try:
-        # ── 1. DOWNLOAD (0 → 10%) ───────────────────────────────────────────
-        await prog(status, status_text("📥 Downloading file...", 5, fname))
-        tg_file = await document.get_file()
-        await tg_file.download_to_drive(cbz_path)
-        await prog(status, status_text("📥 File received!", 10, fname))
+    last_edit = [0.0]
 
-        # ── 2. EXTRACT (10 → 40%) ───────────────────────────────────────────
-        await prog(status, status_text("📂 Extracting CBZ...", 15, fname))
+    # ── DOWNLOAD PROGRESS (0 → 30%) ───────────────────────────────────────────
+    async def dl_progress(current, total):
+        now = time.time()
+        if now - last_edit[0] < 2.5:
+            return
+        last_edit[0] = now
+        pct = int((current / total) * 30) if total else 5
+        mb_now   = current / 1024 / 1024
+        mb_total = total   / 1024 / 1024
+        await safe_edit(
+            status,
+            make_text("📥 Downloading...", pct, fname, f"{mb_now:.1f} / {mb_total:.1f} MB")
+        )
+
+    # ── UPLOAD PROGRESS (90 → 100%) ───────────────────────────────────────────
+    async def ul_progress(current, total):
+        now = time.time()
+        if now - last_edit[0] < 2.5:
+            return
+        last_edit[0] = now
+        pct = 90 + int((current / total) * 10) if total else 92
+        mb_now   = current / 1024 / 1024
+        mb_total = total   / 1024 / 1024
+        await safe_edit(
+            status,
+            make_text("📤 Uploading PDF...", pct, fname, f"{mb_now:.1f} / {mb_total:.1f} MB")
+        )
+
+    try:
+        # ── 1. DOWNLOAD ───────────────────────────────────────────────────────
+        await safe_edit(status, make_text("📥 Downloading...", 5, fname))
+        await app.download_media(message, file_name=str(cbz_path), progress=dl_progress)
+        await safe_edit(status, make_text("📥 Download complete!", 30, fname))
+
+        # ── 2. EXTRACT ────────────────────────────────────────────────────────
+        await safe_edit(status, make_text("📂 Extracting CBZ...", 40, fname))
         loop = asyncio.get_event_loop()
         images = await loop.run_in_executor(None, extract_cbz, cbz_path, extract_dir)
         page_count = len(images)
-        await prog(status, status_text("📂 Extraction done!", 40, fname, f"{page_count} pages found"))
+        await safe_edit(
+            status,
+            make_text("📂 Extraction done!", 50, fname, f"{page_count} pages found")
+        )
 
-        # ── 3. PROCESS IMAGES (40 → 70%) ────────────────────────────────────
-        await prog(status, status_text("🖼️ Processing images...", 55, fname, f"Optimizing {page_count} pages"))
-        await asyncio.sleep(0.5)  # slight pause so user sees this step
-        await prog(status, status_text("🖼️ Images ready!", 70, fname))
+        # ── 3. PROCESS IMAGES ─────────────────────────────────────────────────
+        await safe_edit(
+            status,
+            make_text("🖼️ Processing images...", 65, fname, f"Preparing {page_count} pages")
+        )
 
-        # ── 4. CREATE PDF (70 → 90%) ─────────────────────────────────────────
-        await prog(status, status_text("📄 Creating PDF...", 75, fname))
+        # ── 4. CREATE PDF ─────────────────────────────────────────────────────
+        await safe_edit(status, make_text("📄 Creating PDF...", 75, fname))
         await loop.run_in_executor(None, convert_to_pdf, images, pdf_path)
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
-        await prog(status, status_text("📄 PDF created!", 90, fname, f"Size: {pdf_mb:.1f} MB"))
+        await safe_edit(
+            status,
+            make_text("📄 PDF created!", 90, fname, f"Size: {pdf_mb:.1f} MB")
+        )
 
-        # ── 5. UPLOAD (90 → 100%) ────────────────────────────────────────────
-        await prog(status, status_text("📤 Uploading PDF...", 95, fname))
-        with open(pdf_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=pdf_name,
-                caption=(
-                    f"✅ *{pdf_name}*\n"
-                    f"📄 Pages: *{page_count}*\n"
-                    f"📦 Size: *{pdf_mb:.1f} MB*"
-                ),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        await prog(status, status_text("✅ Done!", 100, fname, "PDF sent successfully"))
+        # ── 5. UPLOAD ─────────────────────────────────────────────────────────
+        last_edit[0] = 0.0
+        await app.send_document(
+            chat_id=chat_id,
+            document=str(pdf_path),
+            file_name=pdf_name,
+            caption=(
+                f"✅ **{pdf_name}**\n"
+                f"📄 Pages: **{page_count}**\n"
+                f"📦 Size: **{pdf_mb:.1f} MB**"
+            ),
+            progress=ul_progress,
+        )
+        await safe_edit(status, make_text("✅ Done!", 100, fname, "PDF sent successfully"))
 
     except zipfile.BadZipFile:
-        await prog(status, f"❌ *{fname}*\n\nCorrupt or invalid CBZ file.")
+        await safe_edit(status, f"❌ **{fname}**\n\nCorrupt or invalid CBZ file.")
     except ValueError as e:
-        await prog(status, f"❌ *{fname}*\n\n{e}")
-    except (TimedOut, NetworkError):
-        await prog(status, f"❌ *{fname}*\n\nNetwork error. Please try again.")
+        await safe_edit(status, f"❌ **{fname}**\n\n{e}")
     except Exception as e:
-        log.exception(f"Error processing {fname}")
-        await prog(status, f"❌ *{fname}*\n\nUnexpected error: `{type(e).__name__}`")
+        log.exception(f"Unexpected error: {fname}")
+        await safe_edit(status, f"❌ **{fname}**\n\nError: `{type(e).__name__}: {e}`")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         log.info(f"Cleaned up: {fname}")
 
-# ─── QUEUE WORKER ─────────────────────────────────────────────────────────────
-async def worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+# ── QUEUE WORKER ───────────────────────────────────────────────────────────────
+async def worker(chat_id: int) -> None:
     q = user_queues[chat_id]
-    while True:
-        document = await q.get()
-        await process_one(chat_id, document, context)
+    while not q.empty():
+        message = await q.get()
+        await process_one(chat_id, message)
         q.task_done()
-        if q.empty():
-            user_workers.pop(chat_id, None)
-            break
+    user_workers.pop(chat_id, None)
 
-# ─── HANDLERS ─────────────────────────────────────────────────────────────────
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *CBZ → PDF Bot*\n\n"
-        "📦 Send me one or multiple `.cbz` files.\n"
-        "I'll convert each one to PDF and send it back.\n\n"
-        "*Features:*\n"
-        "• ✅ Multiple files → processed one by one\n"
-        "• ✅ Real-time progress updates\n"
-        f"• ✅ Up to {MAX_MB}MB per file\n"
-        "• ✅ Auto cleanup after conversion\n\n"
-        "Just drop your CBZ files below ⬇️",
-        parse_mode=ParseMode.MARKDOWN,
+# ── HANDLERS ───────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("start"))
+async def start_cmd(client: Client, message: Message) -> None:
+    await message.reply_text(
+        "👋 **CBZ → PDF Bot**\n\n"
+        "📦 Send me `.cbz` files — one or many!\n"
+        "I'll convert each to PDF and send it back.\n\n"
+        "✅ Supports large files (up to **2GB**)\n"
+        "✅ Real-time download & upload progress\n"
+        "✅ Multiple files processed in queue order\n"
+        "✅ Auto cleanup after every job\n\n"
+        "Drop your CBZ files below ⬇️"
     )
 
-async def doc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc:
-        return
-
+@app.on_message(filters.document)
+async def doc_handler(client: Client, message: Message) -> None:
+    doc   = message.document
     fname = (doc.file_name or "").lower()
+
     if not fname.endswith(".cbz"):
-        await update.message.reply_text(
-            "⚠️ Please send `.cbz` files only.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await message.reply_text("⚠️ Please send `.cbz` files only.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     q = user_queues[chat_id]
-    await q.put(doc)
+    await q.put(message)
 
-    # Tell user it's queued (only if already processing something)
     pos = q.qsize()
     if pos > 1:
-        await update.message.reply_text(
-            f"✅ *{doc.file_name}* added to queue. Position: *#{pos}*",
-            parse_mode=ParseMode.MARKDOWN,
+        await message.reply_text(
+            f"✅ **{doc.file_name}** queued.\n"
+            f"Position: **#{pos}** — processing soon."
         )
 
-    # Spawn worker if not running
     if chat_id not in user_workers or user_workers[chat_id].done():
-        task = asyncio.create_task(worker(chat_id, context))
+        task = asyncio.create_task(worker(chat_id))
         user_workers[chat_id] = task
 
-async def other_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📎 Please send a `.cbz` file to convert.\nUse /start for help.",
-        parse_mode=ParseMode.MARKDOWN,
+@app.on_message(filters.text & ~filters.command("start"))
+async def text_handler(client: Client, message: Message) -> None:
+    await message.reply_text(
+        "📎 Send a `.cbz` file to convert.\nUse /start for help."
     )
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
-    log.info("Starting CBZ → PDF Bot...")
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .read_timeout(300)
-        .write_timeout(300)
-        .connect_timeout(60)
-        .pool_timeout(300)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.Document.ALL, doc_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, other_handler))
-    log.info("Bot running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
-
+# ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    log.info("CBZ → PDF Bot starting (Pyrogram / MTProto)...")
+    app.run()
