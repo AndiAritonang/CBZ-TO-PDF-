@@ -1,0 +1,4 @@
+python-telegram-bot==21.6
+Pillow==10.4.0
+img2pdf==0.5.1
+natsort==8.4.0
