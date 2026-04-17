@@ -1,7 +1,6 @@
-import os, logging, asyncio, zipfile, tempfile, shutil
+import os, re, logging, asyncio, zipfile, tempfile, shutil
 from pathlib import Path
 from collections import defaultdict
-from natsort import natsorted
 from PIL import Image
 import img2pdf
 from telegram import Update
@@ -56,7 +55,9 @@ def extract_cbz(cbz_path: Path, out_dir: Path) -> list[Path]:
     images = [p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED]
     if not images:
         raise ValueError("No images found inside the CBZ file.")
-    return natsorted(images, key=lambda p: p.name.lower())
+    def natural_key(p):
+        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', p.name)]
+    return sorted(images, key=natural_key)
 
 def convert_to_pdf(images: list[Path], pdf_path: Path) -> None:
     safe, temps = [], []
