@@ -25,10 +25,8 @@ app = Client(
     max_concurrent_transmissions=4,
 )
 
-# Global semaphore — max 3 downloads at a time
 DOWNLOAD_SEM = asyncio.Semaphore(3)
 
-# Per-user queue system
 user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_workers: dict[int, asyncio.Task]  = {}
 
