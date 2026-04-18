@@ -25,10 +25,15 @@ app = Client(
     max_concurrent_transmissions=4,
 )
 
+# Global semaphore — max 3 downloads at a time across ALL users
 DOWNLOAD_SEM = asyncio.Semaphore(3)
 
+# Per-user queue system
 user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_workers: dict[int, asyncio.Task]  = {}
+user_timers:  dict[int, asyncio.Task]  = {}   # debounce timer per user
+
+BATCH_WAIT = 3.0   # seconds to wait after last file before starting processing
 
 # ── PROGRESS HELPERS ───────────────────────────────────────────────────────────
 def bar(pct: int) -> str:
@@ -189,10 +194,12 @@ async def process_one(message: Message) -> None:
     pdf_path    = work_dir / pdf_name
 
     try:
+        # ── 1. DOWNLOAD ───────────────────────────────────────────────────────
         await safe_edit(status, make_text("📥 Downloading...", 5, fname))
         await do_download(message, cbz_path, status, fname)
         await safe_edit(status, make_text("📥 Download complete!", 30, fname))
 
+        # ── 2. EXTRACT ────────────────────────────────────────────────────────
         await safe_edit(status, make_text("📂 Extracting...", 42, fname))
         loop = asyncio.get_event_loop()
         try:
@@ -211,11 +218,13 @@ async def process_one(message: Message) -> None:
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, fname, f"{page_count} pages"))
 
+        # ── 3. CONVERT ────────────────────────────────────────────────────────
         await safe_edit(status, make_text("🖼️ Converting...", 70, fname, f"{page_count} pages → PDF"))
         await loop.run_in_executor(None, convert_to_pdf, images, pdf_path)
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
         await safe_edit(status, make_text("📄 PDF ready!", 88, fname, f"{pdf_mb:.1f} MB"))
 
+        # ── 4. UPLOAD ─────────────────────────────────────────────────────────
         last_ul = [0.0]
 
         async def ul_progress(current, total):
@@ -254,18 +263,43 @@ async def process_one(message: Message) -> None:
 
 # ── PER-USER QUEUE WORKER ──────────────────────────────────────────────────────
 async def queue_worker(chat_id: int) -> None:
-    q = user_queues[chat_id]
+    """
+    Waits BATCH_WAIT seconds after the last file arrives,
+    then drains the entire queue, sorts by message_id (= sent order),
+    and processes one by one in correct order.
+    """
     log.info(f"Worker started for chat {chat_id}")
+    q = user_queues[chat_id]
+
     while True:
+        # Wait for at least one message
         message = await q.get()
-        try:
-            await process_one(message)
-        except Exception as e:
-            log.exception(f"Worker caught unhandled error for chat {chat_id}: {e}")
-        finally:
-            q.task_done()
+        batch = [message]
+
+        # Collect any more messages that arrive within BATCH_WAIT seconds
+        while True:
+            try:
+                extra = await asyncio.wait_for(q.get(), timeout=BATCH_WAIT)
+                batch.append(extra)
+            except asyncio.TimeoutError:
+                break  # no more files arriving — start processing
+
+        # Sort by message_id — guarantees original send order
+        batch.sort(key=lambda m: m.id)
+        log.info(f"chat {chat_id}: processing batch of {len(batch)} files in id order: {[m.document.file_name for m in batch]}")
+
+        for msg in batch:
+            try:
+                await process_one(msg)
+            except Exception as e:
+                log.exception(f"Worker error for {msg.document.file_name}: {e}")
+            finally:
+                q.task_done()
+
+        # If new messages arrived while we were processing, loop again
         if q.empty():
             break
+
     user_workers.pop(chat_id, None)
     log.info(f"Worker finished for chat {chat_id}")
 
@@ -274,13 +308,14 @@ async def queue_worker(chat_id: int) -> None:
 async def start_cmd(client: Client, message: Message) -> None:
     await react(message)
     await message.reply_text(
+        "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
         "⚡ **CBZ → PDF Bot**\n\n"
         "Send me .cbz files — one or many....!!!\n"
         "I'll convert each to PDF and send it back...!!!\n\n"
-        "✅ Files processed in **exact order**\n"
+        "✅ Your files processed in **exact order** you send\n"
         "✅ Multiple users handled in **parallel**\n"
         "✅ Large files up to **2GB** supported\n"
-        "✅ Smart retry — up to **8 attempts**\n\n"
+        "✅ Smart retry — up to **8 attempts** per file\n\n"
         "Drop your CBZ files below ⬇️"
     )
 
@@ -295,18 +330,21 @@ async def doc_handler(client: Client, message: Message) -> None:
 
     chat_id = message.chat.id
 
+    # Push into this user's queue
     await user_queues[chat_id].put(message)
 
+    # Spawn worker only if not already running for this user
     if chat_id not in user_workers or user_workers[chat_id].done():
         user_workers[chat_id] = asyncio.create_task(queue_worker(chat_id))
 
-@app.on_message(filters.text & \~filters.command("start"))
+@app.on_message(filters.text & ~filters.command("start"))
 async def text_handler(client: Client, message: Message) -> None:
+    # Ignore forwarded messages and channel posts (spam)
     if message.forward_date or message.sender_chat:
         return
     await react(message)
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("CBZ→PDF Bot Started — CLEAN VERSION (No Promotion)")
+    log.info("CBZ→PDF Bot — HYBRID QUEUE (per-user FIFO + cross-user parallel)")
     app.run()
