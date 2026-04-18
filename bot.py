@@ -25,12 +25,10 @@ app = Client(
     max_concurrent_transmissions=4,
 )
 
-# Global semaphore — max 3 downloads at a time across ALL users
+# Global semaphore — max 3 downloads at a time
 DOWNLOAD_SEM = asyncio.Semaphore(3)
 
 # Per-user queue system
-# user_queues[chat_id]  = asyncio.Queue of Messages
-# user_workers[chat_id] = asyncio.Task running queue_worker
 user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_workers: dict[int, asyncio.Task]  = {}
 
@@ -193,12 +191,10 @@ async def process_one(message: Message) -> None:
     pdf_path    = work_dir / pdf_name
 
     try:
-        # ── 1. DOWNLOAD ───────────────────────────────────────────────────────
         await safe_edit(status, make_text("📥 Downloading...", 5, fname))
         await do_download(message, cbz_path, status, fname)
         await safe_edit(status, make_text("📥 Download complete!", 30, fname))
 
-        # ── 2. EXTRACT ────────────────────────────────────────────────────────
         await safe_edit(status, make_text("📂 Extracting...", 42, fname))
         loop = asyncio.get_event_loop()
         try:
@@ -217,13 +213,11 @@ async def process_one(message: Message) -> None:
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, fname, f"{page_count} pages"))
 
-        # ── 3. CONVERT ────────────────────────────────────────────────────────
         await safe_edit(status, make_text("🖼️ Converting...", 70, fname, f"{page_count} pages → PDF"))
         await loop.run_in_executor(None, convert_to_pdf, images, pdf_path)
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
         await safe_edit(status, make_text("📄 PDF ready!", 88, fname, f"{pdf_mb:.1f} MB"))
 
-        # ── 4. UPLOAD ─────────────────────────────────────────────────────────
         last_ul = [0.0]
 
         async def ul_progress(current, total):
@@ -261,8 +255,6 @@ async def process_one(message: Message) -> None:
         log.info(f"Cleaned: {fname}")
 
 # ── PER-USER QUEUE WORKER ──────────────────────────────────────────────────────
-# Each user gets ONE worker that processes their files STRICTLY in order.
-# Different users run their workers in PARALLEL.
 async def queue_worker(chat_id: int) -> None:
     q = user_queues[chat_id]
     log.info(f"Worker started for chat {chat_id}")
@@ -274,7 +266,6 @@ async def queue_worker(chat_id: int) -> None:
             log.exception(f"Worker caught unhandled error for chat {chat_id}: {e}")
         finally:
             q.task_done()
-        # If queue is now empty, stop this worker — new one spawns on next message
         if q.empty():
             break
     user_workers.pop(chat_id, None)
@@ -285,14 +276,13 @@ async def queue_worker(chat_id: int) -> None:
 async def start_cmd(client: Client, message: Message) -> None:
     await react(message)
     await message.reply_text(
-        "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
         "⚡ **CBZ → PDF Bot**\n\n"
         "Send me .cbz files — one or many....!!!\n"
         "I'll convert each to PDF and send it back...!!!\n\n"
-        "✅ Your files processed in **exact order** you send\n"
+        "✅ Files processed in **exact order**\n"
         "✅ Multiple users handled in **parallel**\n"
         "✅ Large files up to **2GB** supported\n"
-        "✅ Smart retry — up to **8 attempts** per file\n\n"
+        "✅ Smart retry — up to **8 attempts**\n\n"
         "Drop your CBZ files below ⬇️"
     )
 
@@ -307,21 +297,18 @@ async def doc_handler(client: Client, message: Message) -> None:
 
     chat_id = message.chat.id
 
-    # Push into this user's queue
     await user_queues[chat_id].put(message)
 
-    # Spawn worker only if not already running for this user
     if chat_id not in user_workers or user_workers[chat_id].done():
         user_workers[chat_id] = asyncio.create_task(queue_worker(chat_id))
 
-@app.on_message(filters.text & ~filters.command("start"))
+@app.on_message(filters.text & \~filters.command("start"))
 async def text_handler(client: Client, message: Message) -> None:
-    # Ignore forwarded messages and channel posts (spam)
     if message.forward_date or message.sender_chat:
         return
     await react(message)
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("CBZ→PDF Bot — HYBRID QUEUE (per-user FIFO + cross-user parallel)")
+    log.info("CBZ→PDF Bot Started — Clean Version")
     app.run()
