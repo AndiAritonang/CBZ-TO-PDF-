@@ -240,7 +240,10 @@ async def process_one(message: Message) -> None:
             caption=None,
             progress=ul_progress,
         )
-        await safe_edit(status, make_text("✅ Done!", 100, fname, "PDF sent successfully"))
+        try:
+            await status.delete()
+        except Exception:
+            pass
 
     except zipfile.BadZipFile:
         await safe_edit(status, f"❌ **{fname}**\n\nCorrupt ZIP. Please resend.")
