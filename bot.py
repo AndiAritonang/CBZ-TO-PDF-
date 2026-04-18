@@ -72,10 +72,14 @@ def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
     if not zipfile.is_zipfile(cbz_path):
         raise ValueError("__REDOWNLOAD__")
     with zipfile.ZipFile(cbz_path, "r") as zf:
-        for name in zf.namelist():
-            if ".." in name or name.startswith("/"):
-                raise ValueError("Unsafe path in archive.")
-        zf.extractall(out_dir)
+        safe_members = [n for n in zf.namelist() if ".." not in n and not n.startswith("/")]
+        if not safe_members:
+            raise ValueError("No safe files found in archive.")
+        for member in safe_members:
+            try:
+                zf.extract(member, out_dir)
+            except Exception:
+                pass
     images = [
         p for p in out_dir.rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED
@@ -312,6 +316,9 @@ async def doc_handler(client: Client, message: Message) -> None:
 
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_handler(client: Client, message: Message) -> None:
+    # Ignore forwarded messages and channel posts (spam)
+    if message.forward_date or message.sender_chat:
+        return
     await react(message)
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
