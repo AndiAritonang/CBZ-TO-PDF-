@@ -1,5 +1,6 @@
 import os, re, logging, asyncio, zipfile, tempfile, shutil, time
 from pathlib import Path
+from collections import defaultdict
 from PIL import Image
 import img2pdf
 from pyrogram import Client, filters
@@ -24,20 +25,27 @@ app = Client(
     max_concurrent_transmissions=4,
 )
 
-# Max 3 downloads at a time globally — prevents connection overload
+# Global semaphore — max 3 downloads at a time across ALL users
 DOWNLOAD_SEM = asyncio.Semaphore(3)
 
-# ── HELPERS ────────────────────────────────────────────────────────────────────
-def bar(pct):
-    return "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+# Per-user queue system
+# user_queues[chat_id]  = asyncio.Queue of Messages
+# user_workers[chat_id] = asyncio.Task running queue_worker
+user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
+user_workers: dict[int, asyncio.Task]  = {}
 
-def make_text(step, pct, fname, extra=""):
+# ── PROGRESS HELPERS ───────────────────────────────────────────────────────────
+def bar(pct: int) -> str:
+    filled = int(pct / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+def make_text(step: str, pct: int, fname: str, extra: str = "") -> str:
     txt = f"**{fname}**\n\n{step}\n`{bar(pct)}` **{pct}%**"
     if extra:
         txt += f"\n\n__{extra}__"
     return txt
 
-async def safe_edit(msg, text):
+async def safe_edit(msg: Message, text: str) -> None:
     try:
         await msg.edit_text(text)
     except FloodWait as e:
@@ -46,18 +54,20 @@ async def safe_edit(msg, text):
     except Exception:
         pass
 
-async def react(message):
+async def react(message: Message) -> None:
     try:
         await message.react(emoji="⚡")
     except Exception:
         pass
 
-def natural_key(name):
+# ── NATURAL SORT ───────────────────────────────────────────────────────────────
+def natural_key(name: str) -> list:
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', name)]
 
-# ── EXTRACT ────────────────────────────────────────────────────────────────────
-def extract_cbz(cbz_path, out_dir):
-    if cbz_path.stat().st_size < 500:
+# ── EXTRACT CBZ ────────────────────────────────────────────────────────────────
+def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
+    size = cbz_path.stat().st_size
+    if size < 500:
         raise ValueError("__REDOWNLOAD__")
     if not zipfile.is_zipfile(cbz_path):
         raise ValueError("__REDOWNLOAD__")
@@ -66,13 +76,16 @@ def extract_cbz(cbz_path, out_dir):
             if ".." in name or name.startswith("/"):
                 raise ValueError("Unsafe path in archive.")
         zf.extractall(out_dir)
-    images = [p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED]
+    images = [
+        p for p in out_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED
+    ]
     if not images:
-        raise ValueError("No images found in CBZ.")
+        raise ValueError("No supported images found inside CBZ.")
     return sorted(images, key=lambda p: natural_key(p.name))
 
-# ── CONVERT ────────────────────────────────────────────────────────────────────
-def convert_to_pdf(images, pdf_path):
+# ── CONVERT TO PDF ─────────────────────────────────────────────────────────────
+def convert_to_pdf(images: list, pdf_path: Path) -> None:
     safe, temps = [], []
     for img_path in images:
         try:
@@ -80,36 +93,49 @@ def convert_to_pdf(images, pdf_path):
                 if im.mode in ("RGBA", "P", "LA", "L"):
                     conv = img_path.with_suffix("._c.jpg")
                     im.convert("RGB").save(conv, "JPEG", quality=95)
-                    safe.append(conv); temps.append(conv)
+                    safe.append(conv)
+                    temps.append(conv)
                 else:
                     safe.append(img_path)
         except Exception as e:
             log.warning(f"Skipping {img_path.name}: {e}")
+
     if not safe:
-        raise ValueError("All images unreadable.")
+        raise ValueError("All images were unreadable.")
+
     try:
         with open(pdf_path, "wb") as f:
             f.write(img2pdf.convert([str(p) for p in safe]))
     except Exception:
+        log.info("img2pdf failed — Pillow fallback")
         imgs = []
         for p in safe:
-            try: imgs.append(Image.open(p).convert("RGB"))
-            except Exception: pass
+            try:
+                imgs.append(Image.open(p).convert("RGB"))
+            except Exception:
+                pass
         if not imgs:
-            raise ValueError("Pillow fallback failed.")
+            raise ValueError("Pillow fallback also failed.")
         imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:], format="PDF")
     finally:
-        for p in temps: p.unlink(missing_ok=True)
+        for p in temps:
+            p.unlink(missing_ok=True)
 
-# ── DOWNLOAD (with semaphore + retry) ─────────────────────────────────────────
-async def do_download(message, cbz_path, status, fname):
+# ── DOWNLOAD WITH RETRY ────────────────────────────────────────────────────────
+async def do_download(
+    message: Message,
+    cbz_path: Path,
+    status: Message,
+    fname: str,
+) -> None:
     expected = message.document.file_size or 0
     min_size  = max(500, int(expected * 0.95))
     last_edit = [0.0]
 
     async def dl_progress(current, total):
         now = time.time()
-        if now - last_edit[0] < 3.0: return
+        if now - last_edit[0] < 3.0:
+            return
         last_edit[0] = now
         pct = max(5, int((current / total) * 30)) if total else 5
         await safe_edit(status, make_text(
@@ -117,35 +143,44 @@ async def do_download(message, cbz_path, status, fname):
             f"{current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
         ))
 
-    async with DOWNLOAD_SEM:   # max 3 downloads at a time
+    async with DOWNLOAD_SEM:
         for attempt in range(1, 9):
             try:
-                if cbz_path.exists(): cbz_path.unlink()
-                await app.download_media(message, file_name=str(cbz_path), progress=dl_progress)
+                if cbz_path.exists():
+                    cbz_path.unlink()
+                await app.download_media(
+                    message,
+                    file_name=str(cbz_path),
+                    progress=dl_progress,
+                )
                 if cbz_path.exists() and cbz_path.stat().st_size >= min_size:
-                    return   # success
-                log.warning(f"{fname}: attempt {attempt} size too small")
+                    log.info(f"{fname}: downloaded OK on attempt {attempt}")
+                    return
+                log.warning(f"{fname}: attempt {attempt} size mismatch")
             except Exception as e:
                 log.warning(f"{fname}: attempt {attempt} error: {type(e).__name__}: {e}")
 
             wait = min(10 * attempt, 60)
             await safe_edit(status, make_text(
-                f"⏳ Retrying ({attempt}/8)...", 5, fname,
-                f"Waiting {wait}s"
+                f"⏳ Retrying download ({attempt}/8)...",
+                5, fname, f"Waiting {wait}s"
             ))
             await asyncio.sleep(wait)
 
-    raise ValueError("Download failed after 8 attempts. Please resend.")
+    raise ValueError("Download failed after 8 attempts. Please resend the file.")
 
 # ── PROCESS ONE FILE ───────────────────────────────────────────────────────────
-async def process_one(message):
+async def process_one(message: Message) -> None:
     doc      = message.document
     fname    = doc.file_name or "file.cbz"
     stem     = Path(fname).stem
     pdf_name = f"{stem}.pdf"
     chat_id  = message.chat.id
 
-    status = await app.send_message(chat_id, make_text("📥 Starting...", 0, fname))
+    status = await app.send_message(
+        chat_id,
+        make_text("📥 Starting...", 0, fname)
+    )
 
     work_dir    = Path(tempfile.mkdtemp(prefix="cbzbot_"))
     cbz_path    = work_dir / fname
@@ -157,7 +192,7 @@ async def process_one(message):
         # ── 1. DOWNLOAD ───────────────────────────────────────────────────────
         await safe_edit(status, make_text("📥 Downloading...", 5, fname))
         await do_download(message, cbz_path, status, fname)
-        await safe_edit(status, make_text("📥 Done!", 30, fname))
+        await safe_edit(status, make_text("📥 Download complete!", 30, fname))
 
         # ── 2. EXTRACT ────────────────────────────────────────────────────────
         await safe_edit(status, make_text("📂 Extracting...", 42, fname))
@@ -166,7 +201,7 @@ async def process_one(message):
             images = await loop.run_in_executor(None, extract_cbz, cbz_path, extract_dir)
         except ValueError as e:
             if "__REDOWNLOAD__" in str(e):
-                log.warning(f"{fname}: ZIP invalid after download — re-downloading once")
+                log.warning(f"{fname}: ZIP invalid — re-downloading")
                 await safe_edit(status, make_text("⏳ Re-downloading (corrupt)...", 5, fname))
                 shutil.rmtree(extract_dir, ignore_errors=True)
                 extract_dir.mkdir()
@@ -186,9 +221,11 @@ async def process_one(message):
 
         # ── 4. UPLOAD ─────────────────────────────────────────────────────────
         last_ul = [0.0]
+
         async def ul_progress(current, total):
             now = time.time()
-            if now - last_ul[0] < 3.0: return
+            if now - last_ul[0] < 3.0:
+                return
             last_ul[0] = now
             pct = 90 + int((current / total) * 9) if total else 92
             await safe_edit(status, make_text(
@@ -200,55 +237,81 @@ async def process_one(message):
             chat_id=chat_id,
             document=str(pdf_path),
             file_name=pdf_name,
-            caption=(
-                f"✅ **{pdf_name}**\n"
-                f"📄 Pages: **{page_count}**\n"
-                f"📦 Size: **{pdf_mb:.1f} MB**"
-            ),
+            caption=None,
             progress=ul_progress,
         )
         await safe_edit(status, make_text("✅ Done!", 100, fname, "PDF sent successfully"))
 
     except zipfile.BadZipFile:
-        await safe_edit(status, f"❌ **{fname}**\n\nCorrupt file. Please resend.")
+        await safe_edit(status, f"❌ **{fname}**\n\nCorrupt ZIP. Please resend.")
     except ValueError as e:
         await safe_edit(status, f"❌ **{fname}**\n\n{e}")
     except Exception as e:
-        log.exception(f"Error: {fname}")
+        log.exception(f"Unexpected error: {fname}")
         await safe_edit(status, f"❌ **{fname}**\n\nError: `{type(e).__name__}`")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         log.info(f"Cleaned: {fname}")
 
+# ── PER-USER QUEUE WORKER ──────────────────────────────────────────────────────
+# Each user gets ONE worker that processes their files STRICTLY in order.
+# Different users run their workers in PARALLEL.
+async def queue_worker(chat_id: int) -> None:
+    q = user_queues[chat_id]
+    log.info(f"Worker started for chat {chat_id}")
+    while True:
+        message = await q.get()
+        try:
+            await process_one(message)
+        except Exception as e:
+            log.exception(f"Worker caught unhandled error for chat {chat_id}: {e}")
+        finally:
+            q.task_done()
+        # If queue is now empty, stop this worker — new one spawns on next message
+        if q.empty():
+            break
+    user_workers.pop(chat_id, None)
+    log.info(f"Worker finished for chat {chat_id}")
+
 # ── HANDLERS ───────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
-async def start_cmd(client, message):
+async def start_cmd(client: Client, message: Message) -> None:
     await react(message)
     await message.reply_text(
         "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
         "⚡ **CBZ → PDF Bot**\n\n"
         "Send me .cbz files — one or many....!!!\n"
         "I'll convert each to PDF and send it back...!!!\n\n"
-        "✅ Multiple files processed simultaneously\n"
-        "✅ Real-time progress per file\n"
-        "✅ Large files supported up to **2GB**\n"
-        "✅ Smart retry — up to 8 attempts\n\n"
+        "✅ Your files processed in **exact order** you send\n"
+        "✅ Multiple users handled in **parallel**\n"
+        "✅ Large files up to **2GB** supported\n"
+        "✅ Smart retry — up to **8 attempts** per file\n\n"
         "Drop your CBZ files below ⬇️"
     )
 
 @app.on_message(filters.document)
-async def doc_handler(client, message):
+async def doc_handler(client: Client, message: Message) -> None:
     fname = (message.document.file_name or "").lower()
     await react(message)
+
     if not fname.endswith(".cbz"):
         await message.reply_text("⚠️ Please send `.cbz` files only.")
         return
-    asyncio.create_task(process_one(message))
+
+    chat_id = message.chat.id
+
+    # Push into this user's queue
+    await user_queues[chat_id].put(message)
+
+    # Spawn worker only if not already running for this user
+    if chat_id not in user_workers or user_workers[chat_id].done():
+        user_workers[chat_id] = asyncio.create_task(queue_worker(chat_id))
 
 @app.on_message(filters.text & ~filters.command("start"))
-async def text_handler(client, message):
+async def text_handler(client: Client, message: Message) -> None:
     await react(message)
 
+# ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("CBZ→PDF Bot — MULTI-USER PARALLEL + SEMAPHORE (Pyrogram MTProto)")
+    log.info("CBZ→PDF Bot — HYBRID QUEUE (per-user FIFO + cross-user parallel)")
     app.run()
