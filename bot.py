@@ -3,7 +3,7 @@ from pathlib import Path
 from PIL import Image
 import img2pdf
 from pyrogram import Client, filters
-from pyrogram.types import Message, ReactionTypeEmoji
+from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
@@ -19,16 +19,16 @@ log = logging.getLogger(__name__)
 app = Client("cbz_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
-def bar(pct: int) -> str:
+def bar(pct):
     return "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
 
-def make_text(step: str, pct: int, fname: str, extra: str = "") -> str:
+def make_text(step, pct, fname, extra=""):
     txt = f"**{fname}**\n\n{step}\n`{bar(pct)}` **{pct}%**"
     if extra:
         txt += f"\n\n__{extra}__"
     return txt
 
-async def safe_edit(msg: Message, text: str) -> None:
+async def safe_edit(msg, text):
     try:
         await msg.edit_text(text)
     except FloodWait as e:
@@ -37,31 +37,26 @@ async def safe_edit(msg: Message, text: str) -> None:
     except Exception:
         pass
 
-async def react(message: Message) -> None:
+async def react(message):
     try:
         await message.react(emoji="⚡")
     except Exception:
         pass
 
-def natural_key(name: str) -> list:
+def natural_key(name):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', name)]
 
 # ── CBZ EXTRACTION ─────────────────────────────────────────────────────────────
-def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
-    # Check file is not empty
+def extract_cbz(cbz_path, out_dir):
     if cbz_path.stat().st_size < 100:
-        raise ValueError("Downloaded file is too small — possibly corrupted.")
-
-    # Try to repair/open the zip
+        raise ValueError("Downloaded file is too small — possibly incomplete.")
     if not zipfile.is_zipfile(cbz_path):
         raise ValueError("Not a valid CBZ/ZIP file.")
-
     with zipfile.ZipFile(cbz_path, "r") as zf:
         for name in zf.namelist():
             if ".." in name or name.startswith("/"):
-                raise ValueError("Unsafe path detected in archive.")
+                raise ValueError("Unsafe path in archive.")
         zf.extractall(out_dir)
-
     images = [
         p for p in out_dir.rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED
@@ -71,7 +66,7 @@ def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
     return sorted(images, key=lambda p: natural_key(p.name))
 
 # ── PDF CONVERSION ─────────────────────────────────────────────────────────────
-def convert_to_pdf(images: list, pdf_path: Path) -> None:
+def convert_to_pdf(images, pdf_path):
     safe, temps = [], []
     for img_path in images:
         try:
@@ -85,10 +80,8 @@ def convert_to_pdf(images: list, pdf_path: Path) -> None:
                     safe.append(img_path)
         except Exception as e:
             log.warning(f"Skipping {img_path.name}: {e}")
-
     if not safe:
         raise ValueError("All images were unreadable.")
-
     try:
         with open(pdf_path, "wb") as f:
             f.write(img2pdf.convert([str(p) for p in safe]))
@@ -107,8 +100,8 @@ def convert_to_pdf(images: list, pdf_path: Path) -> None:
         for p in temps:
             p.unlink(missing_ok=True)
 
-# ── PROCESS ONE FILE (runs in parallel with others) ────────────────────────────
-async def process_one(message: Message) -> None:
+# ── PROCESS ONE FILE ───────────────────────────────────────────────────────────
+async def process_one(message):
     doc      = message.document
     fname    = doc.file_name or "file.cbz"
     stem     = Path(fname).stem
@@ -131,9 +124,10 @@ async def process_one(message: Message) -> None:
             return
         last_edit[0] = now
         pct = max(5, int((current / total) * 30)) if total else 5
-        mb_now   = current / 1024 / 1024
-        mb_total = total   / 1024 / 1024
-        await safe_edit(status, make_text("📥 Downloading...", pct, fname, f"{mb_now:.1f} / {mb_total:.1f} MB"))
+        await safe_edit(status, make_text(
+            "📥 Downloading...", pct, fname,
+            f"{current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
+        ))
 
     async def ul_progress(current, total):
         now = time.time()
@@ -141,28 +135,27 @@ async def process_one(message: Message) -> None:
             return
         last_edit[0] = now
         pct = 90 + int((current / total) * 9) if total else 92
-        mb_now   = current / 1024 / 1024
-        mb_total = total   / 1024 / 1024
-        await safe_edit(status, make_text("📤 Uploading PDF...", pct, fname, f"{mb_now:.1f} / {mb_total:.1f} MB"))
+        await safe_edit(status, make_text(
+            "📤 Uploading PDF...", pct, fname,
+            f"{current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
+        ))
 
     try:
-        # ── 1. DOWNLOAD (with retry) ───────────────────────────────────────────
+        # ── 1. DOWNLOAD with retry ─────────────────────────────────────────────
         await safe_edit(status, make_text("📥 Downloading...", 5, fname))
-
         download_ok = False
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                if cbz_path.exists():
+                    cbz_path.unlink()
                 await app.download_media(message, file_name=str(cbz_path), progress=dl_progress)
-                # Verify file was actually downloaded
                 if cbz_path.exists() and cbz_path.stat().st_size > 100:
                     download_ok = True
                     break
-                else:
-                    log.warning(f"Attempt {attempt}: file too small, retrying...")
-                    await asyncio.sleep(2 * attempt)
+                log.warning(f"Attempt {attempt}: file too small, waiting...")
             except Exception as e:
                 log.warning(f"Download attempt {attempt} failed: {e}")
-                await asyncio.sleep(2 * attempt)
+            await asyncio.sleep(3 * attempt)
 
         if not download_ok:
             raise ValueError("Download failed after 3 attempts. Please resend the file.")
@@ -176,7 +169,7 @@ async def process_one(message: Message) -> None:
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, fname, f"{page_count} pages found"))
 
-        # ── 3. PROCESS + CONVERT ──────────────────────────────────────────────
+        # ── 3. CONVERT ────────────────────────────────────────────────────────
         await safe_edit(status, make_text("🖼️ Processing images...", 65, fname, f"Converting {page_count} pages"))
         await loop.run_in_executor(None, convert_to_pdf, images, pdf_path)
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
@@ -210,7 +203,7 @@ async def process_one(message: Message) -> None:
 
 # ── HANDLERS ───────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
-async def start_cmd(client: Client, message: Message) -> None:
+async def start_cmd(client, message):
     await react(message)
     await message.reply_text(
         "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
@@ -225,21 +218,18 @@ async def start_cmd(client: Client, message: Message) -> None:
     )
 
 @app.on_message(filters.document)
-async def doc_handler(client: Client, message: Message) -> None:
+async def doc_handler(client, message):
     doc   = message.document
     fname = (doc.file_name or "").lower()
-
     await react(message)
-
     if not fname.endswith(".cbz"):
         await message.reply_text("⚠️ Please send `.cbz` files only.")
         return
-
-    # Fire and forget — all files run in parallel
+    # Parallel — every file gets its own task immediately
     asyncio.create_task(process_one(message))
 
 @app.on_message(filters.text & ~filters.command("start"))
-async def text_handler(client: Client, message: Message) -> None:
+async def text_handler(client, message):
     await react(message)
     await message.reply_text(
         "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
@@ -250,5 +240,5 @@ async def text_handler(client: Client, message: Message) -> None:
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("CBZ → PDF Bot starting — parallel mode (Pyrogram MTProto)...")
-    app.run() 
+    log.info("CBZ→PDF Bot starting — PARALLEL mode (Pyrogram MTProto)...")
+    app.run()
