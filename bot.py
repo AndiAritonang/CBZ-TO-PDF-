@@ -309,4 +309,4 @@ async def text_handler(client: Client, message: Message) -> None:
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("CBZ→PDF Bot Started — Clean & Fixed Version")
-    app.run()
+    app.run() 
