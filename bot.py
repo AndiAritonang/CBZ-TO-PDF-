@@ -302,11 +302,7 @@ async def doc_handler(client: Client, message: Message) -> None:
     if chat_id not in user_workers or user_workers[chat_id].done():
         user_workers[chat_id] = asyncio.create_task(queue_worker(chat_id))
 
-# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-# Yeh line sabse important hai — isme koi \\~ nahi hona chahiye
 @app.on_message(filters.text & \~filters.command("start"))
-# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-
 async def text_handler(client: Client, message: Message) -> None:
     if message.forward_date or message.sender_chat:
         return
