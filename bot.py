@@ -10,7 +10,7 @@ from pyrogram.errors import FloodWait
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 API_ID    = int(os.environ.get("API_ID",    "37623239"))
 API_HASH  =     os.environ.get("API_HASH",  "9661c0bdbd8392709dd93139e8c3afcb")
-BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8663170411:AAEer7ziKHmqIg1TZ-7QN_jzSd17aH6gNfc")
+BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8250891942:AAHQC097gKPyGhYvuxQGcKhAlS_EVgJ0ojk")
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 BATCH_WAIT = 4.0  # seconds to wait after last file to collect full batch
 
