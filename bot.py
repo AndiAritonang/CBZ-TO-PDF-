@@ -4,13 +4,13 @@ from collections import defaultdict
 from PIL import Image
 import img2pdf
 from pyrogram import Client, filters
-from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-API_ID    = int(os.environ.get("API_ID",    "37623239"))
-API_HASH  =     os.environ.get("API_HASH",  "9661c0bdbd8392709dd93139e8c3afcb")
-BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8663170411:AAGOMwGydm7c0Cq-7JedNAegbPdFIHq7-4c")
+API_ID    = int(os.environ.get("API_ID"))
+API_HASH  = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 BATCH_WAIT = 4.0
 
@@ -30,6 +30,7 @@ app = Client(
 DOWNLOAD_SEM = asyncio.Semaphore(3)
 user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_workers: dict[int, asyncio.Task]  = {}
+STOP = object()
 
 # ── PROGRESS ───────────────────────────────────────────────────────────────────
 def bar(pct):
@@ -154,6 +155,19 @@ async def do_download(message, cbz_path, status, fname):
 
     raise ValueError("Download failed after 8 attempts. Please resend.")
 
+# ── SAFE SEND DOCUMENT ─────────────────────────────────────────────────────────
+async def safe_send_document(**kwargs):
+    for attempt in range(1, 6):
+        try:
+            return await app.send_document(**kwargs)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception as e:
+            log.warning(f"send_document attempt {attempt} failed: {type(e).__name__}: {e}")
+            if attempt == 5:
+                raise
+            await asyncio.sleep(3 * attempt)
+
 # ── PROCESS ONE FILE ───────────────────────────────────────────────────────────
 async def process_one(message):
     doc      = message.document
@@ -189,7 +203,7 @@ async def process_one(message):
                 break
             except ValueError as e:
                 if "__REDOWNLOAD__" not in str(e):
-                    raise  # real error, not a zip issue
+                    raise
                 log.warning(f"{fname}: ZIP invalid on extract attempt {extract_attempt}, re-downloading...")
                 await safe_edit(status, make_text(
                     f"⏳ Re-downloading ({extract_attempt}/3)...", 10, fname,
@@ -225,7 +239,7 @@ async def process_one(message):
                 f"{current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
             ))
 
-        await app.send_document(
+        await safe_send_document(
             chat_id=chat_id,
             document=str(pdf_path),
             file_name=pdf_name,
@@ -251,17 +265,23 @@ async def queue_worker(chat_id):
     log.info(f"Worker started: chat {chat_id}")
 
     while True:
-        first = await q.get()
-        batch = [first]
+        msg = await q.get()
+        if msg is STOP:
+            q.task_done()
+            break
 
+        batch = [msg]
         deadline = time.time() + BATCH_WAIT
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             try:
-                msg = await asyncio.wait_for(q.get(), timeout=remaining)
-                batch.append(msg)
+                m = await asyncio.wait_for(q.get(), timeout=remaining)
+                if m is STOP:
+                    q.task_done()
+                    break
+                batch.append(m)
                 deadline = time.time() + BATCH_WAIT
             except asyncio.TimeoutError:
                 break
@@ -269,16 +289,13 @@ async def queue_worker(chat_id):
         batch.sort(key=lambda m: m.id)
         log.info(f"chat {chat_id}: {len(batch)} files → {[m.document.file_name for m in batch]}")
 
-        for msg in batch:
+        for m in batch:
             try:
-                await process_one(msg)
+                await process_one(m)
             except Exception as e:
                 log.exception(f"Worker error: {e}")
             finally:
                 q.task_done()
-
-        if q.empty():
-            break
 
     user_workers.pop(chat_id, None)
     log.info(f"Worker done: chat {chat_id}")
@@ -288,10 +305,9 @@ async def queue_worker(chat_id):
 async def start_cmd(client, message):
     await react(message)
     await message.reply_text(
-        "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
         "⚡ **CBZ → PDF Bot**\n\n"
-        "Send me .cbz files — one or many....!!!\n"
-        "I'll convert each to PDF and send it back...!!!\n\n"
+        "Send me .cbz files — one or many.\n"
+        "I'll convert each to PDF and send it back.\n\n"
         "✅ Files processed in **exact order** you send\n"
         "✅ Multiple users handled in **parallel**\n"
         "✅ Large files up to **2GB** supported\n"
@@ -322,4 +338,4 @@ async def text_handler(client, message):
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("CBZ→PDF Bot — HYBRID QUEUE (per-user FIFO + cross-user parallel)")
-    app.run() 
+    app.run()
