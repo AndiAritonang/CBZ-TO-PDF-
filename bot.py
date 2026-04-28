@@ -322,4 +322,4 @@ async def text_handler(client, message):
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("CBZ→PDF Bot — HYBRID QUEUE (per-user FIFO + cross-user parallel)")
-    app.run()
+    app.run() 
