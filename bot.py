@@ -10,40 +10,38 @@ from pyrogram.errors import FloodWait
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 API_ID    = int(os.environ.get("API_ID",    "37623239"))
 API_HASH  =     os.environ.get("API_HASH",  "9661c0bdbd8392709dd93139e8c3afcb")
-BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8250891942:AAHQC097gKPyGhYvuxQGcKhAlS_EVgJ0ojk")
+BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8663170411:AAGOMwGydm7c0Cq-7JedNAegbPdFIHq7-4c")
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
-BATCH_WAIT = 4.0  # seconds to wait after last file to collect full batch
+BATCH_WAIT = 4.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Client(
-    "cbz_bot",
+    "cbz_bot_fresh",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     sleep_threshold=60,
     max_concurrent_transmissions=4,
+    in_memory=True,
 )
 
-# Global semaphore — max 3 downloads at a time across all users
 DOWNLOAD_SEM = asyncio.Semaphore(3)
-
-# Per-user state
 user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_workers: dict[int, asyncio.Task]  = {}
 
 # ── PROGRESS ───────────────────────────────────────────────────────────────────
-def bar(pct: int) -> str:
+def bar(pct):
     return "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
 
-def make_text(step: str, pct: int, fname: str, extra: str = "") -> str:
+def make_text(step, pct, fname, extra=""):
     txt = f"**{fname}**\n\n{step}\n`{bar(pct)}` **{pct}%**"
     if extra:
         txt += f"\n\n__{extra}__"
     return txt
 
-async def safe_edit(msg: Message, text: str) -> None:
+async def safe_edit(msg, text):
     try:
         await msg.edit_text(text)
     except FloodWait as e:
@@ -52,24 +50,23 @@ async def safe_edit(msg: Message, text: str) -> None:
     except Exception:
         pass
 
-async def safe_delete(msg: Message) -> None:
+async def safe_delete(msg):
     try:
         await msg.delete()
     except Exception:
         pass
 
-async def react(message: Message) -> None:
+async def react(message):
     try:
         await message.react(emoji="⚡")
     except Exception:
         pass
 
-# ── NATURAL SORT ───────────────────────────────────────────────────────────────
-def natural_key(name: str) -> list:
+def natural_key(name):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', name)]
 
-# ── EXTRACT CBZ ────────────────────────────────────────────────────────────────
-def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
+# ── EXTRACT ────────────────────────────────────────────────────────────────────
+def extract_cbz(cbz_path, out_dir):
     if cbz_path.stat().st_size < 500:
         raise ValueError("__REDOWNLOAD__")
     if not zipfile.is_zipfile(cbz_path):
@@ -81,16 +78,13 @@ def extract_cbz(cbz_path: Path, out_dir: Path) -> list:
                 zf.extract(member, out_dir)
             except Exception:
                 pass
-    images = [
-        p for p in out_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED
-    ]
+    images = [p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED]
     if not images:
         raise ValueError("No supported images found inside CBZ.")
     return sorted(images, key=lambda p: natural_key(p.name))
 
-# ── CONVERT TO PDF ─────────────────────────────────────────────────────────────
-def convert_to_pdf(images: list, pdf_path: Path) -> None:
+# ── CONVERT ────────────────────────────────────────────────────────────────────
+def convert_to_pdf(images, pdf_path):
     safe, temps = [], []
     for img_path in images:
         try:
@@ -105,7 +99,7 @@ def convert_to_pdf(images: list, pdf_path: Path) -> None:
         except Exception as e:
             log.warning(f"Skipping {img_path.name}: {e}")
     if not safe:
-        raise ValueError("All images were unreadable.")
+        raise ValueError("All images unreadable.")
     try:
         with open(pdf_path, "wb") as f:
             f.write(img2pdf.convert([str(p) for p in safe]))
@@ -125,7 +119,7 @@ def convert_to_pdf(images: list, pdf_path: Path) -> None:
             p.unlink(missing_ok=True)
 
 # ── DOWNLOAD WITH RETRY ────────────────────────────────────────────────────────
-async def do_download(message: Message, cbz_path: Path, status: Message, fname: str) -> None:
+async def do_download(message, cbz_path, status, fname):
     expected = message.document.file_size or 0
     min_size  = max(500, int(expected * 0.95))
     last_edit = [0.0]
@@ -152,18 +146,16 @@ async def do_download(message: Message, cbz_path: Path, status: Message, fname: 
                     return
                 log.warning(f"{fname}: attempt {attempt} size mismatch")
             except Exception as e:
-                log.warning(f"{fname}: attempt {attempt} error: {type(e).__name__}: {e}")
+                log.warning(f"{fname}: attempt {attempt} — {type(e).__name__}: {e}")
 
             wait = min(10 * attempt, 60)
-            await safe_edit(status, make_text(
-                f"⏳ Retrying ({attempt}/8)...", 5, fname, f"Waiting {wait}s"
-            ))
+            await safe_edit(status, make_text(f"⏳ Retrying ({attempt}/8)...", 5, fname, f"Waiting {wait}s"))
             await asyncio.sleep(wait)
 
     raise ValueError("Download failed after 8 attempts. Please resend.")
 
 # ── PROCESS ONE FILE ───────────────────────────────────────────────────────────
-async def process_one(message: Message) -> None:
+async def process_one(message):
     doc      = message.document
     fname    = doc.file_name or "file.cbz"
     stem     = Path(fname).stem
@@ -229,7 +221,6 @@ async def process_one(message: Message) -> None:
             caption=None,
             progress=ul_progress,
         )
-        # Delete progress message — only PDF remains
         await safe_delete(status)
 
     except zipfile.BadZipFile:
@@ -244,24 +235,14 @@ async def process_one(message: Message) -> None:
         log.info(f"Cleaned: {fname}")
 
 # ── QUEUE WORKER ───────────────────────────────────────────────────────────────
-async def queue_worker(chat_id: int) -> None:
-    """
-    Per-user worker:
-    1. Waits for first message
-    2. Collects all messages that arrive within BATCH_WAIT seconds
-    3. Sorts entire batch by message.id (= original send order, even for forwards)
-    4. Processes one by one in that order
-    5. Loops if more messages arrive while processing
-    """
+async def queue_worker(chat_id):
     q = user_queues[chat_id]
     log.info(f"Worker started: chat {chat_id}")
 
     while True:
-        # Wait for first item
         first = await q.get()
         batch = [first]
 
-        # Drain everything that arrives in the next BATCH_WAIT seconds
         deadline = time.time() + BATCH_WAIT
         while True:
             remaining = deadline - time.time()
@@ -270,24 +251,21 @@ async def queue_worker(chat_id: int) -> None:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=remaining)
                 batch.append(msg)
-                # Reset deadline each time a new file arrives
                 deadline = time.time() + BATCH_WAIT
             except asyncio.TimeoutError:
                 break
 
-        # Sort by message_id — guaranteed original send order
         batch.sort(key=lambda m: m.id)
-        log.info(f"chat {chat_id}: batch {len(batch)} files → {[m.document.file_name for m in batch]}")
+        log.info(f"chat {chat_id}: {len(batch)} files → {[m.document.file_name for m in batch]}")
 
         for msg in batch:
             try:
                 await process_one(msg)
             except Exception as e:
-                log.exception(f"Worker error: {msg.document.file_name}: {e}")
+                log.exception(f"Worker error: {e}")
             finally:
                 q.task_done()
 
-        # If queue got more items while we were processing, loop again
         if q.empty():
             break
 
@@ -296,7 +274,7 @@ async def queue_worker(chat_id: int) -> None:
 
 # ── HANDLERS ───────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
-async def start_cmd(client: Client, message: Message) -> None:
+async def start_cmd(client, message):
     await react(message)
     await message.reply_text(
         "Iam PArshyas CBZ TO PDF bot...!!!\n\n"
@@ -311,27 +289,21 @@ async def start_cmd(client: Client, message: Message) -> None:
     )
 
 @app.on_message(filters.document)
-async def doc_handler(client: Client, message: Message) -> None:
-    # Ignore forwarded channel posts (spam)
+async def doc_handler(client, message):
     if message.sender_chat:
         return
-
     fname = (message.document.file_name or "").lower()
     await react(message)
-
     if not fname.endswith(".cbz"):
         await message.reply_text("⚠️ Please send `.cbz` files only.")
         return
-
     chat_id = message.chat.id
     await user_queues[chat_id].put(message)
-
-    # Spawn worker only if not already running
     if chat_id not in user_workers or user_workers[chat_id].done():
         user_workers[chat_id] = asyncio.create_task(queue_worker(chat_id))
 
 @app.on_message(filters.text & ~filters.command("start"))
-async def text_handler(client: Client, message: Message) -> None:
+async def text_handler(client, message):
     if message.forward_date or message.sender_chat:
         return
     await react(message)
