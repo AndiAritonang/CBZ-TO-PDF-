@@ -179,18 +179,29 @@ async def process_one(message):
         # 2. EXTRACT
         await safe_edit(status, make_text("📂 Extracting...", 42, fname))
         loop = asyncio.get_event_loop()
-        try:
-            images = await loop.run_in_executor(None, extract_cbz, cbz_path, extract_dir)
-        except ValueError as e:
-            if "__REDOWNLOAD__" in str(e):
-                log.warning(f"{fname}: ZIP invalid — re-downloading")
-                await safe_edit(status, make_text("⏳ Re-downloading (corrupt)...", 5, fname))
+
+        # Try extract up to 3 times — re-download if ZIP is invalid
+        extract_ok = False
+        for extract_attempt in range(1, 4):
+            try:
+                images = await loop.run_in_executor(None, extract_cbz, cbz_path, extract_dir)
+                extract_ok = True
+                break
+            except ValueError as e:
+                if "__REDOWNLOAD__" not in str(e):
+                    raise  # real error, not a zip issue
+                log.warning(f"{fname}: ZIP invalid on extract attempt {extract_attempt}, re-downloading...")
+                await safe_edit(status, make_text(
+                    f"⏳ Re-downloading ({extract_attempt}/3)...", 10, fname,
+                    "File incomplete — retrying"
+                ))
+                await asyncio.sleep(5 * extract_attempt)
                 shutil.rmtree(extract_dir, ignore_errors=True)
                 extract_dir.mkdir()
                 await do_download(message, cbz_path, status, fname)
-                images = await loop.run_in_executor(None, extract_cbz, cbz_path, extract_dir)
-            else:
-                raise
+
+        if not extract_ok:
+            raise ValueError("File could not be extracted after 3 attempts. Please resend.")
 
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, fname, f"{page_count} pages"))
