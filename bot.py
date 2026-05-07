@@ -7,7 +7,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
+# ── CONFIG
 API_ID    = int(os.environ.get("API_ID",    "37623239"))
 API_HASH  =     os.environ.get("API_HASH",  "9661c0bdbd8392709dd93139e8c3afcb")
 BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8663170411:AAGOMwGydm7c0Cq-7JedNAegbPdFIHq7-4c")
@@ -31,7 +31,7 @@ DOWNLOAD_SEM = asyncio.Semaphore(3)
 user_queues:  dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_workers: dict[int, asyncio.Task]  = {}
 
-# ── PROGRESS ───────────────────────────────────────────────────────────────────
+# ── PROGRESS
 def bar(pct):
     return "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
 
@@ -65,7 +65,7 @@ async def react(message):
 def natural_key(name):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', name)]
 
-# ── ZIP CHECK — fast, just lists members, no decompress ───────────────────────
+# ── ZIP CHECK
 def zip_is_openable(path):
     try:
         with zipfile.ZipFile(path, "r") as zf:
@@ -74,12 +74,12 @@ def zip_is_openable(path):
     except Exception:
         return False
 
-# ── EXTRACT ────────────────────────────────────────────────────────────────────
+# ── EXTRACT
 def extract_cbz(cbz_path, out_dir):
     with zipfile.ZipFile(cbz_path, "r") as zf:
         for member in zf.namelist():
             if ".." in member or member.startswith("/"):
-                continue  # skip unsafe, don't fail
+                continue
             try:
                 zf.extract(member, out_dir)
             except Exception:
@@ -92,7 +92,7 @@ def extract_cbz(cbz_path, out_dir):
         raise ValueError("No supported images found inside CBZ.")
     return sorted(images, key=lambda p: natural_key(p.name))
 
-# ── CONVERT ────────────────────────────────────────────────────────────────────
+# ── CONVERT
 def convert_to_pdf(images, pdf_path):
     safe, temps = [], []
     for img_path in images:
@@ -127,9 +127,7 @@ def convert_to_pdf(images, pdf_path):
         for p in temps:
             p.unlink(missing_ok=True)
 
-# ── DOWNLOAD ──────────────────────────────────────────────────────────────────
-# Strategy: download once cleanly. If zip won't open after download,
-# wait and retry — this handles Telegram upload-lag on large batches.
+# ── DOWNLOAD
 async def do_download(message, cbz_path, status, fname):
     expected = message.document.file_size or 0
     min_size  = max(500, int(expected * 0.95))
@@ -146,7 +144,6 @@ async def do_download(message, cbz_path, status, fname):
             f"{current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
         ))
 
-    # Waits between retries: 5s, 10s, 20s, 30s, 45s, 60s, 60s, 60s
     waits = [5, 10, 20, 30, 45, 60, 60, 60]
 
     async with DOWNLOAD_SEM:
@@ -180,7 +177,7 @@ async def do_download(message, cbz_path, status, fname):
 
     raise ValueError("Download failed after all attempts. Please resend the file.")
 
-# ── PROCESS ONE FILE ───────────────────────────────────────────────────────────
+# ── PROCESS ONE FILE
 async def process_one(message):
     doc      = message.document
     fname    = doc.file_name or "file.cbz"
@@ -195,26 +192,31 @@ async def process_one(message):
     extract_dir.mkdir()
     pdf_path    = work_dir / pdf_name
 
+    orig_caption = message.caption
+    thumb_path = None
     try:
-        # 1. DOWNLOAD
+        if doc.thumbs:
+            thumb_path = work_dir / "thumb.jpg"
+            await app.download_media(doc.thumbs[-1], file_name=str(thumb_path))
+    except Exception:
+        thumb_path = None
+
+    try:
         await safe_edit(status, make_text("📥 Downloading...", 5, fname))
         await do_download(message, cbz_path, status, fname)
         await safe_edit(status, make_text("📥 Done!", 30, fname))
 
-        # 2. EXTRACT
         await safe_edit(status, make_text("📂 Extracting...", 42, fname))
         loop = asyncio.get_event_loop()
         images = await loop.run_in_executor(None, extract_cbz, cbz_path, extract_dir)
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, fname, f"{page_count} pages"))
 
-        # 3. CONVERT
         await safe_edit(status, make_text("🖼️ Converting...", 70, fname, f"{page_count} pages → PDF"))
         await loop.run_in_executor(None, convert_to_pdf, images, pdf_path)
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
         await safe_edit(status, make_text("📄 PDF ready!", 88, fname, f"{pdf_mb:.1f} MB"))
 
-        # 4. UPLOAD
         last_ul = [0.0]
         async def ul_progress(current, total):
             now = time.time()
@@ -231,7 +233,8 @@ async def process_one(message):
             chat_id=chat_id,
             document=str(pdf_path),
             file_name=pdf_name,
-            caption=None,
+            caption=orig_caption,
+            thumb=str(thumb_path) if thumb_path and thumb_path.exists() else None,
             progress=ul_progress,
         )
         await safe_delete(status)
@@ -247,7 +250,7 @@ async def process_one(message):
         shutil.rmtree(work_dir, ignore_errors=True)
         log.info(f"Cleaned: {fname}")
 
-# ── QUEUE WORKER ───────────────────────────────────────────────────────────────
+# ── QUEUE WORKER
 async def queue_worker(chat_id):
     q = user_queues[chat_id]
     log.info(f"Worker started: chat {chat_id}")
@@ -279,7 +282,7 @@ async def queue_worker(chat_id):
     user_workers.pop(chat_id, None)
     log.info(f"Worker done: chat {chat_id}")
 
-# ── HANDLERS ───────────────────────────────────────────────────────────────────
+# ── HANDLERS
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
     await react(message)
