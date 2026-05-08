@@ -2,7 +2,6 @@ import os, re, logging, asyncio, zipfile, tempfile, shutil, time
 from pathlib import Path
 from collections import defaultdict
 from PIL import Image
-import img2pdf
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
@@ -12,10 +11,12 @@ API_ID    = int(os.environ.get("API_ID",    "37623239"))
 API_HASH  =     os.environ.get("API_HASH",  "9661c0bdbd8392709dd93139e8c3afcb")
 BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8663170411:AAGOMwGydm7c0Cq-7JedNAegbPdFIHq7-4c")
 
-# All archive formats we accept — try to open as ZIP first (most CBR/CB7 are ZIP too)
 ARCHIVE_EXTS = {".cbz", ".cbr", ".cb7", ".cbt", ".zip"}
 SUPPORTED    = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 BATCH_WAIT   = 4.0
+
+# Resize limit (longest side). Increase/decrease as needed.
+MAX_SIDE = 3000
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -79,10 +80,6 @@ def zip_is_openable(path):
 
 # ── EXTRACT ────────────────────────────────────────────────────────────────────
 def extract_archive(archive_path, out_dir):
-    """
-    Tries to open as ZIP (handles CBZ, CBR, CB7, ZIP — many are just renamed ZIPs).
-    Extracts all supported images, sorts naturally.
-    """
     try:
         with zipfile.ZipFile(archive_path, "r") as zf:
             for member in zf.namelist():
@@ -103,50 +100,29 @@ def extract_archive(archive_path, out_dir):
         raise ValueError("No supported images found inside the archive.")
     return sorted(images, key=lambda p: natural_key(p.name))
 
-# ── CONVERT ────────────────────────────────────────────────────────────────────
+# ── CONVERT (Pillow only) ──────────────────────────────────────────────────────
 def convert_to_pdf(images, pdf_path):
-    """
-    Memory-safe conversion: try img2pdf first (fast, lossless).
-    Fall back to Pillow if img2pdf fails.
-    Images processed one-by-one to avoid RAM spikes on large files.
-    """
-    safe, temps = [], []
-    for img_path in images:
-        try:
-            with Image.open(img_path) as im:
-                if im.mode in ("RGBA", "P", "LA", "L"):
-                    conv = img_path.with_suffix("._c.jpg")
-                    im.convert("RGB").save(conv, "JPEG", quality=90)
-                    safe.append(conv)
-                    temps.append(conv)
-                else:
-                    safe.append(img_path)
-        except Exception as e:
-            log.warning(f"Skipping {img_path.name}: {e}")
-
-    if not safe:
-        raise ValueError("All images were unreadable.")
-
-    # Try img2pdf first
+    pil_imgs = []
     try:
-        with open(pdf_path, "wb") as f:
-            f.write(img2pdf.convert([str(p) for p in safe]))
-        return
-    except Exception as e:
-        log.info(f"img2pdf failed ({e}) — Pillow fallback")
-
-    # Pillow fallback — open one by one, close immediately after appending
-    try:
-        pil_imgs = []
-        for p in safe:
+        for img_path in images:
             try:
-                im = Image.open(p).convert("RGB")
-                pil_imgs.append(im)
-            except Exception as ex:
-                log.warning(f"Pillow skip {p.name}: {ex}")
+                with Image.open(img_path) as im:
+                    im = im.convert("RGB")
+
+                    # Resize if too large
+                    w, h = im.size
+                    max_side = max(w, h)
+                    if max_side > MAX_SIDE:
+                        scale = MAX_SIDE / max_side
+                        new_size = (int(w * scale), int(h * scale))
+                        im = im.resize(new_size, Image.LANCZOS)
+
+                    pil_imgs.append(im.copy())
+            except Exception as e:
+                log.warning(f"Skipping {img_path.name}: {e}")
 
         if not pil_imgs:
-            raise ValueError("No readable images for Pillow fallback.")
+            raise ValueError("All images were unreadable.")
 
         pil_imgs[0].save(
             pdf_path,
@@ -160,8 +136,6 @@ def convert_to_pdf(images, pdf_path):
                 im.close()
             except Exception:
                 pass
-        for p in temps:
-            p.unlink(missing_ok=True)
 
 # ── DOWNLOAD ───────────────────────────────────────────────────────────────────
 async def do_download(message, archive_path, status, fname):
@@ -209,7 +183,6 @@ async def do_download(message, archive_path, status, fname):
 
 # ── GET THUMBNAIL ──────────────────────────────────────────────────────────────
 async def get_thumbnail(message, work_dir):
-    """Download thumbnail from original message if present."""
     try:
         doc = message.document
         if doc.thumbs and len(doc.thumbs) > 0:
@@ -227,7 +200,7 @@ async def process_one(message):
     orig_fname = doc.file_name or "file"
     stem       = os.path.splitext(orig_fname)[0]
     pdf_name   = stem + ".pdf"
-    caption    = message.caption          # None if no caption — kept as-is
+    caption    = message.caption
     chat_id    = message.chat.id
 
     status = await app.send_message(chat_id, make_text("📥 Starting...", 0, orig_fname))
@@ -238,35 +211,27 @@ async def process_one(message):
     pdf_path     = work_dir / pdf_name
 
     try:
-        # 1. DOWNLOAD
         await safe_edit(status, make_text("📥 Downloading...", 5, orig_fname))
         await do_download(message, archive_path, status, orig_fname)
         await safe_edit(status, make_text("📥 Done!", 30, orig_fname))
 
-        # 2. THUMBNAIL (parallel with extract — don't block)
         thumb_task = asyncio.create_task(get_thumbnail(message, work_dir))
 
-        # 3. EXTRACT
         await safe_edit(status, make_text("📂 Extracting...", 42, orig_fname))
         loop = asyncio.get_event_loop()
         images = await loop.run_in_executor(None, extract_archive, archive_path, extract_dir)
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, orig_fname, f"{page_count} pages"))
 
-        # 4. CONVERT — with 10 min timeout to prevent silent hang
         await safe_edit(status, make_text("🖼️ Converting...", 70, orig_fname, f"{page_count} pages → PDF"))
-        try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, convert_to_pdf, images, pdf_path),
-                timeout=600  # 10 minutes max
-            )
-        except asyncio.TimeoutError:
-            raise ValueError("Conversion timed out. File may be too large or complex.")
+        await asyncio.wait_for(
+            loop.run_in_executor(None, convert_to_pdf, images, pdf_path),
+            timeout=600
+        )
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
         await safe_edit(status, make_text("📄 PDF ready!", 88, orig_fname, f"{pdf_mb:.1f} MB"))
 
-        # 5. UPLOAD — with original thumbnail + original caption
-        thumb_path = await thumb_task  # get thumbnail result
+        thumb_path = await thumb_task
 
         last_ul = [0.0]
         async def ul_progress(current, total):
@@ -284,8 +249,8 @@ async def process_one(message):
             chat_id=chat_id,
             document=str(pdf_path),
             file_name=pdf_name,
-            caption=caption,          # original caption or None
-            thumb=thumb_path,         # original thumbnail or None
+            caption=caption,
+            thumb=thumb_path,
             progress=ul_progress,
         )
         await safe_delete(status)
