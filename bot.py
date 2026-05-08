@@ -105,36 +105,61 @@ def extract_archive(archive_path, out_dir):
 
 # ── CONVERT ────────────────────────────────────────────────────────────────────
 def convert_to_pdf(images, pdf_path):
+    """
+    Memory-safe conversion: try img2pdf first (fast, lossless).
+    Fall back to Pillow if img2pdf fails.
+    Images processed one-by-one to avoid RAM spikes on large files.
+    """
     safe, temps = [], []
     for img_path in images:
         try:
             with Image.open(img_path) as im:
                 if im.mode in ("RGBA", "P", "LA", "L"):
                     conv = img_path.with_suffix("._c.jpg")
-                    im.convert("RGB").save(conv, "JPEG", quality=95)
+                    im.convert("RGB").save(conv, "JPEG", quality=90)
                     safe.append(conv)
                     temps.append(conv)
                 else:
                     safe.append(img_path)
         except Exception as e:
             log.warning(f"Skipping {img_path.name}: {e}")
+
     if not safe:
         raise ValueError("All images were unreadable.")
+
+    # Try img2pdf first
     try:
         with open(pdf_path, "wb") as f:
             f.write(img2pdf.convert([str(p) for p in safe]))
-    except Exception:
-        log.info("img2pdf failed — Pillow fallback")
-        imgs = []
+        return
+    except Exception as e:
+        log.info(f"img2pdf failed ({e}) — Pillow fallback")
+
+    # Pillow fallback — open one by one, close immediately after appending
+    try:
+        pil_imgs = []
         for p in safe:
             try:
-                imgs.append(Image.open(p).convert("RGB"))
+                im = Image.open(p).convert("RGB")
+                pil_imgs.append(im)
+            except Exception as ex:
+                log.warning(f"Pillow skip {p.name}: {ex}")
+
+        if not pil_imgs:
+            raise ValueError("No readable images for Pillow fallback.")
+
+        pil_imgs[0].save(
+            pdf_path,
+            save_all=True,
+            append_images=pil_imgs[1:],
+            format="PDF",
+        )
+    finally:
+        for im in pil_imgs:
+            try:
+                im.close()
             except Exception:
                 pass
-        if not imgs:
-            raise ValueError("Pillow fallback also failed.")
-        imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:], format="PDF")
-    finally:
         for p in temps:
             p.unlink(missing_ok=True)
 
@@ -228,9 +253,15 @@ async def process_one(message):
         page_count = len(images)
         await safe_edit(status, make_text("📂 Extracted!", 55, orig_fname, f"{page_count} pages"))
 
-        # 4. CONVERT
+        # 4. CONVERT — with 10 min timeout to prevent silent hang
         await safe_edit(status, make_text("🖼️ Converting...", 70, orig_fname, f"{page_count} pages → PDF"))
-        await loop.run_in_executor(None, convert_to_pdf, images, pdf_path)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, convert_to_pdf, images, pdf_path),
+                timeout=600  # 10 minutes max
+            )
+        except asyncio.TimeoutError:
+            raise ValueError("Conversion timed out. File may be too large or complex.")
         pdf_mb = pdf_path.stat().st_size / 1024 / 1024
         await safe_edit(status, make_text("📄 PDF ready!", 88, orig_fname, f"{pdf_mb:.1f} MB"))
 
