@@ -1,7 +1,7 @@
 import os, re, logging, asyncio, zipfile, tempfile, shutil, time
 from pathlib import Path
 from collections import defaultdict
-from PIL import Image
+from PIL import Image, ImageFile
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
@@ -15,8 +15,10 @@ ARCHIVE_EXTS = {".cbz", ".cbr", ".cb7", ".cbt", ".zip"}
 SUPPORTED    = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 BATCH_WAIT   = 4.0
 
-# Resize limit (longest side). Increase/decrease as needed.
-MAX_SIDE = 3000
+# low-RAM friendly
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+MAX_SIDE = 1600
+JPEG_QUALITY = 75
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -100,16 +102,14 @@ def extract_archive(archive_path, out_dir):
         raise ValueError("No supported images found inside the archive.")
     return sorted(images, key=lambda p: natural_key(p.name))
 
-# ── CONVERT (Pillow only) ──────────────────────────────────────────────────────
+# ── CONVERT (Pillow only, low RAM) ─────────────────────────────────────────────
 def convert_to_pdf(images, pdf_path):
-    pil_imgs = []
+    temp_files = []
     try:
         for img_path in images:
             try:
                 with Image.open(img_path) as im:
                     im = im.convert("RGB")
-
-                    # Resize if too large
                     w, h = im.size
                     max_side = max(w, h)
                     if max_side > MAX_SIDE:
@@ -117,23 +117,28 @@ def convert_to_pdf(images, pdf_path):
                         new_size = (int(w * scale), int(h * scale))
                         im = im.resize(new_size, Image.LANCZOS)
 
-                    pil_imgs.append(im.copy())
+                    tmp = img_path.with_suffix(".tmp.jpg")
+                    im.save(tmp, "JPEG", quality=JPEG_QUALITY, optimize=True)
+                    temp_files.append(tmp)
             except Exception as e:
                 log.warning(f"Skipping {img_path.name}: {e}")
 
-        if not pil_imgs:
+        if not temp_files:
             raise ValueError("All images were unreadable.")
 
-        pil_imgs[0].save(
-            pdf_path,
-            save_all=True,
-            append_images=pil_imgs[1:],
-            format="PDF",
-        )
-    finally:
-        for im in pil_imgs:
-            try:
+        first = Image.open(temp_files[0]).convert("RGB")
+        rest = [Image.open(p).convert("RGB") for p in temp_files[1:]]
+        try:
+            first.save(pdf_path, save_all=True, append_images=rest, format="PDF")
+        finally:
+            first.close()
+            for im in rest:
                 im.close()
+
+    finally:
+        for p in temp_files:
+            try:
+                p.unlink(missing_ok=True)
             except Exception:
                 pass
 
